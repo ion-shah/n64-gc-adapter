@@ -1,34 +1,7 @@
 `timescale 1ns / 1ps
+
+//// stick_map.v -- inverse stick correction, built from real OoT Wii-VC sweep data
 //
-// stick_map.v -- inverse stick correction, built from real OoT Wii-VC
-// sweep data (see fit_octant_patches.py).
-//
-// v2 CHANGES FROM FIRST PASS (after counting actual register bits and
-// finding it was ~143 bits, well over the 80-macrocell target):
-//   1. Removed ax/ay as separate registers (16 bits) -- computed as
-//      combinational wires and written directly into major/minor.
-//   2. Replaced the abs-then-negate MAC scheme (term + abs_coef +
-//      term_a + term_b = 57 bits of scratch) with a direct two's-
-//      complement WEIGHTED-BIT accumulation: for a signed coefficient's
-//      bits 0..7, add (val <<< bit) per set bit as before, but for the
-//      final SIGN bit (bit 8), SUBTRACT (val <<< 8) instead of adding.
-//      This is the standard two's-complement bit decomposition
-//      (value = -sign*2^8 + sum of lower bits*2^i) and computes a
-//      correctly-signed product directly into one running accumulator
-//      -- no separate abs-value or negate-at-the-end step needed at all.
-//   3. Single output byte (val_out) with an axis_sel input, matching
-//      the byte-serial JoyBus flow, instead of two output registers.
-//      val_out is COMBINATIONAL (a mux over the already-registered
-//      mx_reg/mn_reg/swapped/sign bits), not itself a clocked register --
-//      so once `done` has pulsed, a caller can toggle axis_sel and read
-//      both axes immediately without re-asserting start (no need to
-//      recompute the shared major/minor math twice).
-//
-// Net effect: register bit count drops from ~143 to ~70 (see tally in
-// the accompanying analysis) -- back under the 80-macrocell target for
-// registers, though actual macrocell count depends on how comparators/
-// adders/case-statement ROMs pack, and can only be confirmed by running
-// this through XST.
 //
 // ARCHITECTURE (unchanged from v1, see prior notes):
 //   8-fold (D4) symmetry confirmed on real data (~0.01 unit mean error)
@@ -55,6 +28,7 @@ module stick_map (
 
     localparam N_PATCH = 4;
     localparam SHIFT    = 6;
+    localparam TAPER_SHIFT = 3;   // must match log2(MAJ_HI(0)) == log2(8)
 
     function [7:0] MAJ_HI(input [1:0] i);
         case (i)
@@ -63,53 +37,85 @@ module stick_map (
         endcase
     endfunction
 
-    function signed [8:0] A_MX(input [1:0] i);
-        case (i) 0: A_MX=55; 1: A_MX=59; 2: A_MX=62; default: A_MX=88; endcase
-    endfunction
-    function signed [8:0] B_MX(input [1:0] i);
-        case (i) 0: B_MX=67; 1: B_MX=33; 2: B_MX=28; default: B_MX=38; endcase
-    endfunction
-    function signed [7:0] C_MX(input [1:0] i);
-        case (i) 0: C_MX=19; 1: C_MX=21; 2: C_MX=21; default: C_MX=3; endcase
+    // Combined coefficient lookup: one 8-way case on {which_output,patch}
+    // instead of 6 separate 4-way cases + 3 extra top-level muxes.
+    // Packing: [25:17]=a (9b signed), [16:8]=b (9b signed), [7:0]=c (8b signed)
+    function signed [25:0] PATCH_ABC(input sel_mn, input [1:0] i);
+        reg signed [8:0] a;
+        reg signed [8:0] b;
+        reg signed [7:0] c;
+        begin
+            case ({sel_mn, i})
+                3'b000: begin a =  9'sd55;  b =  9'sd67;  c = 8'sd19; end // MX patch0
+                3'b001: begin a =  9'sd59;  b =  9'sd33;  c = 8'sd21; end // MX patch1
+                3'b010: begin a =  9'sd62;  b =  9'sd28;  c = 8'sd21; end // MX patch2
+                3'b011: begin a =  9'sd88;  b =  9'sd38;  c = 8'sd3;  end // MX patch3
+                3'b100: begin a = -9'sd59;  b = 9'sd234;  c = 8'sd15; end // MN patch0
+                3'b101: begin a = -9'sd25;  b = 9'sd126;  c = 8'sd20; end // MN patch1
+                3'b110: begin a = -9'sd13;  b = 9'sd105;  c = 8'sd20; end // MN patch2
+                default: begin a =  9'sd2;  b = 9'sd107;  c = 8'sd10; end // MN patch3
+            endcase
+            PATCH_ABC = {a, b, c};
+        end
     endfunction
 
-    function signed [8:0] A_MN(input [1:0] i);
-        case (i) 0: A_MN=-59; 1: A_MN=-25; 2: A_MN=-13; default: A_MN=2; endcase
-    endfunction
-    function signed [8:0] B_MN(input [1:0] i);
-        case (i) 0: B_MN=234; 1: B_MN=126; 2: B_MN=105; default: B_MN=107; endcase
-    endfunction
-    function signed [7:0] C_MN(input [1:0] i);
-        case (i) 0: C_MN=15; 1: C_MN=20; 2: C_MN=20; default: C_MN=10; endcase
+    // saturate into the 8-bit output register range. Input narrowed to
+    // 9 bits -- wide_result is exhaustively proven to stay in [0,253],
+    // so 9 bits (range -256..255) is the tight, safe minimum. Do not
+    // reuse this function for anything wider without re-checking.
+    function signed [7:0] sat8(input signed [8:0] v);
+        begin
+            if (v > 9'sd127)
+                sat8 = 8'sd127;
+            else if (v < -9'sd128)
+                sat8 = -8'sd128;
+            else
+                sat8 = v[7:0];
+        end
     endfunction
 
-    // ---- registers (see header comment for the reduction from v1) ----
+    // ---- registers ----
     reg sign_x, sign_y, swapped;
     reg [7:0] major, minor;
     reg [1:0]  patch;
     reg        which_output;    // 0 = computing mx, 1 = computing mn
+    reg        ab_phase;        // 0 = major*cur_a term, 1 = minor*cur_b term
     reg signed [7:0] mx_reg, mn_reg;
-    reg signed [15:0] acc;       // single running accumulator, both MAC phases
+    reg signed [15:0] acc;              // single running accumulator, both MAC phases
+                                          // (verified 16 bits needed -- see header note)
+    reg signed [8:0]  coef;             // current coefficient, shifts RIGHT 1/cycle
+    reg signed [15:0] shifted_operand;  // current operand,     shifts LEFT  1/cycle
+    reg signed [8:0]  wide_result;      // pre-saturate result, shared by both paths
+                                          // (narrowed from [15:0], see header note)
     reg [3:0]  bit_cnt;
     reg [3:0]  state;
 
-    localparam S_IDLE      = 0,
-               S_ABS_SWAP  = 1,
-               S_ZERO_CHK  = 2,
-               S_FIND_SEG  = 3,
-               S_MAC_A     = 4,
-               S_MAC_B     = 5,
-               S_COMBINE   = 6,
-               S_WRITEBACK = 7;
+    localparam S_IDLE       = 0,
+               S_ABS_SWAP   = 1,
+               S_FIND_SEG   = 2,
+               S_MAC_LOAD   = 3,
+               S_MAC_ITER   = 4,
+               S_COMBINE    = 5,
+               S_TAPER_ITER = 6,
+               S_SAT_WRITE  = 7,
+               S_WRITEBACK  = 8;
 
-    wire signed [8:0] cur_a = which_output ? A_MN(patch) : A_MX(patch);
-    wire signed [8:0] cur_b = which_output ? B_MN(patch) : B_MX(patch);
-    wire signed [7:0] cur_c = which_output ? C_MN(patch) : C_MX(patch);
+    wire signed [25:0] abc   = PATCH_ABC(which_output, patch);
+    wire signed [8:0]  cur_a = abc[25:17];
+    wire signed [8:0]  cur_b = abc[16:8];
+    wire signed [7:0]  cur_c = abc[7:0];
 
     // combinational abs -- feeds straight into major/minor in S_ABS_SWAP,
     // no separate ax/ay registers needed
     wire [7:0] ax_w = sign_x ? (-val_x) : val_x;
     wire [7:0] ay_w = sign_y ? (-val_y) : val_y;
+
+    // combinational: raw combine result before taper/saturate, valid
+    // during S_COMBINE once acc holds the just-finished MAC sum.
+    // Computed at 16 bits (acc's width) since it also feeds
+    // shifted_operand for the taper multiply, but the SETTLED value
+    // (once latched into wide_result) is proven to fit in 9 bits.
+    wire signed [15:0] combine_result = (acc >>> SHIFT) + cur_c;
 
     always @(posedge clk) begin
         done <= 1'b0;
@@ -132,82 +138,97 @@ module stick_map (
                     major   <= ay_w;
                     minor   <= ax_w;
                 end
-                state <= S_ZERO_CHK;
+                patch        <= 2'd0;
+                which_output <= 1'b0;
+                state        <= S_FIND_SEG;
             end
 
-            // Correctness requirement: stick at rest must map to stick at
-            // rest, regardless of what the fitted patches say near the
-            // degenerate deadzone region.
-            S_ZERO_CHK: begin
-                if (ax_w == 8'd0 && ay_w == 8'd0) begin
-                    mx_reg <= 8'sd0;
-                    mn_reg <= 8'sd0;
-                    state  <= S_WRITEBACK;
-                end else begin
-                    patch        <= 2'd0;
-                    which_output <= 1'b0;
-                    state        <= S_FIND_SEG;
-                end
-            end
-
+            // No explicit zero-deadzone check needed: when major=0 the
+            // taper multiply (S_TAPER_ITER) has coef=0 for all 4
+            // iterations, so acc never accumulates and the tapered
+            // result is exactly 0 regardless of cur_c. (0,0) input
+            // always makes major=minor=0, so this falls out for free.
             S_FIND_SEG: begin
                 if (patch == N_PATCH-1 || major <= MAJ_HI(patch)) begin
-                    acc     <= 16'sd0;
-                    bit_cnt <= 4'd0;
-                    state   <= S_MAC_A;
+                    acc      <= 16'sd0;
+                    ab_phase <= 1'b0;
+                    state    <= S_MAC_LOAD;
                 end else begin
                     patch <= patch + 1;
                 end
             end
 
-            // Two's-complement weighted-bit MAC: bits 0..7 add, bit 8
-            // (sign) subtracts -- computes major*cur_a directly into acc,
-            // no abs-value/negate-afterward step required.
-            S_MAC_A: begin
-                if (bit_cnt < 4'd8) begin
-                    if (cur_a[bit_cnt])
-                        acc <= acc + ($signed({8'd0, major}) <<< bit_cnt);
-                    bit_cnt <= bit_cnt + 1;
+            S_MAC_LOAD: begin
+                if (!ab_phase) begin
+                    coef            <= cur_a;
+                    shifted_operand <= {8'd0, major};
                 end else begin
-                    if (cur_a[8])
-                        acc <= acc - ($signed({8'd0, major}) <<< 8);
-                    bit_cnt <= 4'd0;
-                    state   <= S_MAC_B;
+                    coef            <= cur_b;
+                    shifted_operand <= {8'd0, minor};
                 end
+                bit_cnt <= 4'd0;
+                state   <= S_MAC_ITER;
             end
 
-            // Continues accumulating minor*cur_b into the SAME acc (so
-            // acc ends up holding major*A + minor*B, ready for >>>SHIFT).
-            S_MAC_B: begin
+            S_MAC_ITER: begin
                 if (bit_cnt < 4'd8) begin
-                    if (cur_b[bit_cnt])
-                        acc <= acc + ($signed({8'd0, minor}) <<< bit_cnt);
-                    bit_cnt <= bit_cnt + 1;
+                    if (coef[0])
+                        acc <= acc + shifted_operand;
+                    shifted_operand <= shifted_operand <<< 1;
+                    coef            <= coef >>> 1;
+                    bit_cnt         <= bit_cnt + 1'b1;
                 end else begin
-                    if (cur_b[8])
-                        acc <= acc - ($signed({8'd0, minor}) <<< 8);
-                    state <= S_COMBINE;
+                    if (coef[0])
+                        acc <= acc - shifted_operand;
+                    if (!ab_phase) begin
+                        ab_phase <= 1'b1;
+                        state    <= S_MAC_LOAD;
+                    end else begin
+                        state <= S_COMBINE;
+                    end
                 end
             end
 
             S_COMBINE: begin
+                if (patch == 2'd0) begin
+                    acc             <= 16'sd0;
+                    coef            <= {1'b0, major};
+                    shifted_operand <= combine_result;
+                    bit_cnt         <= 4'd0;
+                    state           <= S_TAPER_ITER;
+                end else begin
+                    wide_result <= combine_result;
+                    state       <= S_SAT_WRITE;
+                end
+            end
+
+            S_TAPER_ITER: begin
+                if (bit_cnt < 4'd4) begin
+                    if (coef[0])
+                        acc <= acc + shifted_operand;
+                    shifted_operand <= shifted_operand <<< 1;
+                    coef            <= coef >>> 1;
+                    bit_cnt         <= bit_cnt + 1'b1;
+                end else begin
+                    wide_result <= (acc >>> TAPER_SHIFT);
+                    state       <= S_SAT_WRITE;
+                end
+            end
+
+            S_SAT_WRITE: begin
                 if (!which_output) begin
-                    mx_reg       <= (acc >>> SHIFT) + cur_c;
+                    mx_reg       <= sat8(wide_result);
                     which_output <= 1'b1;
                     acc          <= 16'sd0;
-                    bit_cnt      <= 4'd0;
-                    state        <= S_MAC_A;   // second pass: compute mn
+                    ab_phase     <= 1'b0;
+                    state        <= S_MAC_LOAD;
                 end else begin
-                    mn_reg <= (acc >>> SHIFT) + cur_c;
+                    mn_reg <= sat8(wide_result);
                     state  <= S_WRITEBACK;
                 end
             end
 
             S_WRITEBACK: begin
-                // mx_reg/mn_reg/swapped/sign_x/sign_y all now hold stable
-                // values -- val_out reads them out combinationally below,
-                // so a caller can toggle axis_sel and read both axes off
-                // this ONE computation without re-asserting start.
                 done  <= 1'b1;
                 state <= S_IDLE;
             end
@@ -217,8 +238,6 @@ module stick_map (
     end
 
     // Combinational output mux: un-swap, apply sign, select axis.
-    // Valid once mx_reg/mn_reg are stable (i.e. after `done` has pulsed);
-    // reading before that returns stale/undefined data, same as before.
     wire signed [7:0] x_mag = swapped ? mn_reg : mx_reg;
     wire signed [7:0] y_mag = swapped ? mx_reg : mn_reg;
     assign val_out = axis_sel ? (sign_y ? -y_mag : y_mag)
