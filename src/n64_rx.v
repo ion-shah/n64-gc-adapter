@@ -8,38 +8,41 @@
 //   All bits are transmitted MSB first. Communication is always initiated by
 //   the console. The line idles HIGH. The device pulls LOW to start each bit.
 //
-//   Bit encoding — all controller bits are exactly 4us total:
+//   Bit encoding at 22MHz (clk_core, ~45.45ns/tick) — from n64brew.dev spec:
 //
-//     Logic 1:           Logic 0:        Controller Stop Bit:
-//     ___            _   _           _   _                   __
-//    |   |          | | |           | | |                   |
-//  ──┘   └──────────┘ └─┘           └─┘ └───────────────────┘
-//     1us   3us          3us   1us          3us LOW, 1us HIGH
+//     Logic 1:      Logic 0:      Controller Stop: 
+//      __             ______        ___            
+//     |  |           |      |      |   |           
+//   ──┘  └──────── ──┘      └──  ──┘   └──────────  
+//      1us  3us       3us  1us     2us    2us        
 //
-//   Logic 1        : 1us low  (~50 ticks)  + 3us high (~150 ticks) = 4us total
-//   Logic 0        : 3us low  (~150 ticks) + 1us high (~50 ticks)  = 4us total
-//   Controller Stop: 3us low  (~150 ticks) + returns HIGH (line idle)
+//   Logic 1             : 1us low  ( 22 ticks) + 3us high ( 66 ticks) = 4us
+//   Logic 0             : 3us low  ( 66 ticks) + 1us high ( 22 ticks) = 4us
+//   Controller Stop Bit : 2us low  ( 44 ticks) + 2us high ( 44 ticks) = 4us
 //
-//   IMPORTANT — Controller Stop Bit vs Console Stop Bit:
-//     Controller Stop Bit (device→console): 3us low pulse. Identical pulse
-//       width to a logic-0. Distinguished only by position — it is ALWAYS
-//       the bit immediately after the 32nd data bit, never before.
-//     Console Stop Bit (console→device): 3us total, 1us low + 2us high.
-//       Only relevant for n64_tx (transmitter), not this receiver.
+//   N64 Console Stop Bit: 1us low  ( 22 ticks) + 2us high ( 44 ticks) = 3us
 //
-//   Because the controller stop bit has the SAME low-pulse width as a logic-0
-//   (3us / ~150 ticks), the receiver CANNOT distinguish it from a data bit
-//   by pulse width alone. It must be blocked by position: after 32 data bits
-//   have been received (packet_done=1), rising edges are ignored until the
-//   inter-poll idle gap resets the receiver.
+//   GameCube Stop Bit   : 1us low  ( 22 ticks) + 3us high ( 66 ticks) = 4us
+//     -- identical to a logic-1 bit, per jefflongo.dev's GC controller
+//     reverse-engineering writeup. NOT the same shape as the N64 controller
+//     stop bit above it (which is genuinely unique, 2us/2us). This module
+//     (n64_rx) has nothing to do with generating the GC stop bit -- that's
+//     joybus_tx.v, on the CPLD's transmit side toward the Wii -- but the
+//     entry is kept in this table since it's the natural place to compare
+//     all four stop/terminator shapes side by side.
 //
-// TIMING at 50MHz (20ns/tick):
-//   1us  = 50 ticks    (logic-1 low phase)
-//   3us  = 150 ticks   (logic-0 / stop bit low phase)
-//   THRESHOLD = 100 ticks (2us midpoint — classifies 1 vs 0)
-//   IDLE_THRESH = 500 ticks (~10us) — above the max valid bit duration (4us /
-//     200 ticks). The real inter-poll gap at 60Hz is ~16ms. 10us is safely
-//     in the gap between poll cycles without being too conservative.
+//   Console Stop Bit is sent by the console (CPLD) after 0x01 command.
+//   It is 1us low + 2us high (3us total). Handled by n64_tx, not here.
+//
+// TIMING at 22MHz (clk_core, ~45.45ns/tick):
+//   1us  ≈  22 ticks   (logic-1 low, console stop low)
+//   2us  ≈  44 ticks   (controller stop low, controller stop high)
+//   3us  ≈  66 ticks   (logic-0 low, logic-1 high)
+//   THRESHOLD   = 44 ticks — midpoint between 22 (1us) and 66 (3us)
+//     Controller stop bit (44 ticks low) hits exactly at threshold.
+//     Because packet_done blocks it, this boundary case never matters.
+//   IDLE_THRESH = 220 ticks (~10us) — above max 4us bit duration,
+//     safely below 16ms inter-poll gap. Resets framing between polls.
 //
 //   Update THRESHOLD after hardware characterization with logic analyzer.
 //   Measure actual low-pulse widths on your specific controller and adjust
@@ -56,7 +59,11 @@
 //   [29]    Z button          [28]    Start
 //   [27]    D-Up              [26]    D-Down
 //   [25]    D-Left            [24]    D-Right
-//   [23]    Reserved (0)      [22]    Reserved (0)
+//   [23]    RST               [22]    Reserved (always 0)
+//             RST=1 when L+R+Start held simultaneously. Controller internally
+//             resets analog stick to (0,0) and clears Start bit. CPLD receives
+//             this packet normally — no special handling needed. top.v does not
+//             map bit [23] to any GC output, so RST is correctly ignored.
 //   [21]    L button          [20]    R button
 //   [19]    C-Up              [18]    C-Down
 //   [17]    C-Left            [16]    C-Right
@@ -77,7 +84,7 @@
 // =============================================================================
 
 module n64_rx (
-    input  wire        clk,        // 50MHz — 20ns per tick
+    input  wire        clk,        // clk_core, ~22MHz — ~45.45ns per tick
     input  wire        data_in,    // N64 JoyBus line (1kΩ pull-up to 3.3V, idles HIGH)
     output reg         bit_out,    // Decoded bit value: 1 or 0
     output reg         bit_valid,  // Pulses HIGH for exactly one clock cycle when bit_out is ready
@@ -89,13 +96,13 @@ module n64_rx (
     // Parameters
     // Update THRESHOLD after characterizing your specific controller in PulseView.
     // -------------------------------------------------------------------------
-    parameter THRESHOLD   = 8'd100;   // ticks — midpoint between 50 (1us) and 150 (3us)
-    parameter IDLE_THRESH = 16'd500;  // ticks (~10us) — safely above max 4us bit duration
+    parameter THRESHOLD   = 8'd44;    // ticks — midpoint between 22(1us) and 66(3us) at 22MHz
+    parameter IDLE_THRESH = 10'd220;  // ticks (~10us at 22MHz), fits 10 bits (max 1023)
 
     // -------------------------------------------------------------------------
     // Stage 1: Two-stage synchronizer
     // -------------------------------------------------------------------------
-    // data_in is asynchronous to our 50MHz clock domain. Sampling it directly
+    // data_in is asynchronous to our clk_core (~22MHz) domain. Sampling it directly
     // risks a metastable latch that can take arbitrarily long to resolve.
     // Two flip-flop stages give the signal one full clock period to settle.
     // d1 is the stable output — all downstream logic uses d1, never data_in.
@@ -116,14 +123,20 @@ module n64_rx (
     // -------------------------------------------------------------------------
     // Stage 2: Low-pulse-width counter
     // -------------------------------------------------------------------------
-    // Counts 50MHz clock ticks while the line is held LOW.
+    // Counts clk_core (~22MHz) ticks while the line is held LOW.
     // Reset to 0 on each falling edge (start of new bit).
     // Increments each cycle while d1==0.
     // On rising edge: compare to THRESHOLD to classify 1 vs 0.
     //
-    // 8 bits handles up to 255 ticks (5.1us). The longest valid pulse is
-    // 3us (150 ticks). Saturation at 255 provides safe handling of any
-    // unexpectedly long low pulse — still correctly classifies as 0.
+    // 8 bits covers up to 255 ticks (~11.6us at 22MHz). The longest valid
+    // pulse is 3us (66 ticks), well inside range. Unlike high_count below,
+    // this counter has NO saturation guard -- it will wrap past 255 if the
+    // line is held low longer than that. In practice this would require an
+    // abnormally long low pulse that shouldn't occur in valid protocol
+    // operation (max legitimate low phase is 3us / 66 ticks), so it isn't
+    // guarded the way high_count is, but it's worth knowing this is a
+    // silent wraparound, not a saturating clamp, if you're ever debugging
+    // an actual malformed/glitchy line.
     // -------------------------------------------------------------------------
     reg [7:0] low_count = 8'd0;
 
@@ -136,16 +149,19 @@ module n64_rx (
     // and we are in the inter-poll gap — safe to re-arm packet_done and
     // re-synchronize bit_count for the next poll cycle.
     //
-    // Why 10us threshold (500 ticks)?
-    //   Max valid HIGH phase inside a transmission = 3us (150 ticks, logic-1 high)
+    // Why 10us threshold (220 ticks)?
+    //   Max valid HIGH phase inside a transmission = 3us (66 ticks, logic-1 high)
     //   Stop bit high phase ≥ 1us (line returns high and stays there)
     //   Inter-poll gap at 60Hz ≈ 16ms >> 10us
     //   10us is unambiguously between polls, not inside any valid bit sequence.
     //
-    // 16-bit counter: holds up to 1.3ms before saturating. Saturates at
-    // IDLE_THRESH (500) to fire exactly once, not every cycle after.
+    // 10-bit counter (matches reg [9:0], max range 1023 ticks / ~46.5us at
+    // 22MHz), but it never actually reaches that range: the explicit
+    // `if (high_count < IDLE_THRESH)` guard below stops it at IDLE_THRESH
+    // (220 ticks, ~10us) and holds it there, so it fires exactly once, not
+    // every cycle after.
     // -------------------------------------------------------------------------
-    reg [15:0] high_count = 16'd0;
+    reg [9:0] high_count = 10'd0;
 
     // -------------------------------------------------------------------------
     // Stage 4: Bit counter and packet framing
@@ -172,7 +188,7 @@ module n64_rx (
         if (falling) begin
             // New bit starting: reset pulse counter and idle timer
             low_count  <= 8'd0;
-            high_count <= 16'd0;
+            high_count <= 10'd0;
         end else if (d1 == 1'b0) begin
             // Line still LOW: increment pulse counter
             low_count  <= low_count + 8'd1;
@@ -182,7 +198,7 @@ module n64_rx (
         // Count consecutive ticks the line is HIGH. Saturate at IDLE_THRESH.
         if (d1 == 1'b1 && !falling) begin
             if (high_count < IDLE_THRESH)
-                high_count <= high_count + 16'd1;
+                high_count <= high_count + 10'd1;
         end
 
         // --- Inter-poll gap detected: re-arm receiver ---
@@ -193,7 +209,7 @@ module n64_rx (
             packet_done <= 1'b0;
             bit_count   <= 6'd0;
         end
-     
+
         // --- Bit classification on rising edge ---
         // Gated by !packet_done:
         //   - During normal reception (bits 0–31): packet_done=0, bits are classified
