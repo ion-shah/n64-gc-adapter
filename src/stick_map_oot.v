@@ -46,14 +46,14 @@ module stick_map (
         reg signed [7:0] c;
         begin 
             case ({sel_mn, i})
-                3'b000: begin a =  9'sd55;  b =  9'sd67;  c = 8'sd19; end // MX patch0 close middle
-                3'b001: begin a =  9'sd59;  b =  9'sd33;  c = 8'sd21; end // MX patch1 close middle
-                3'b010: begin a =  9'sd62;  b =  9'sd28;  c = 8'sd21; end // MX patch2 further middle
-                3'b011: begin a =  9'sd88;  b =  9'sd38;  c = 8'sd3;  end // MX patch3 back edge
-                3'b100: begin a = -9'sd59;  b = 9'sd234;  c = 8'sd15; end // MN patch0 middle
-                3'b101: begin a = -9'sd25;  b = 9'sd126;  c = 8'sd20; end // MN patch1 also middle
-                3'b110: begin a = -9'sd13;  b = 9'sd105;  c = 8'sd20; end // MN patch2
-                default: begin a =  9'sd2;  b = 9'sd107;  c = 8'sd10; end // MN patch3
+                3'b000: begin a =  9'sd7;   b =  9'sd30;  c = 8'sd36; end // MX patch0 close middle
+                3'b001: begin a =  9'sd78;  b =  9'sd32;  c = 8'sd28; end // MX patch1 close middle
+                3'b010: begin a =  9'sd84;  b =  9'sd32;  c = 8'sd26; end // MX patch2 further middle
+                3'b011: begin a =  9'sd81;  b =  9'sd32;  c = 8'sd27; end // MX patch3 back edge
+                3'b100: begin a = -9'sd113; b = 9'sd123;  c = 8'sd39; end // MN patch0 middle
+                3'b101: begin a = -9'sd18;  b = 9'sd130;  c = 8'sd27; end // MN patch1 also middle
+                3'b110: begin a = -9'sd11;  b = 9'sd127;  c = 8'sd25; end // MN patch2
+                default: begin a = -9'sd13; b = 9'sd126;  c = 8'sd27; end // MN patch3
             endcase
             PATCH_ABC = {a, b, c};
         end
