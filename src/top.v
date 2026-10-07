@@ -184,6 +184,7 @@ module top (
         .clk     (clk_core),
         .start   (sm_start),
         .axis_sel(sm_axis_sel),
+        .is_mm   (dip[4]),  // 0 = oot, 1 = mm
         .val_x   (n64_state[15:8]),
         .val_y   (n64_state[7:0]),
         .val_out (sm_val_out),

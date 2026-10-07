@@ -46,7 +46,7 @@ module top_hw (
     output wire       led3_r,   // PIN_49 (off)
     output wire       led3_g,   // PIN_51 (N64: dbg_n64_pkt_ready)
     output wire       led3_b,   // PIN_50 (N64: dbg_n64_poll_pending)
-    output wire       led4_r,   // PIN_43 (off, unused)
+    output wire       led4_r,   // PIN_43 (which mapping mode is active)
     output wire       led4_g,   // PIN_48 (off, unused)
     output wire       led4_b,   // PIN_47 (off, unused)
     output wire       dbg_clk_core_pin // PIN_84
@@ -96,7 +96,7 @@ module top_hw (
     assign led3_b = dbg_n64_poll_pending ? 1'b0 : 1'b1;
 
     // D4 = OFF -- unused, all channels held off
-    assign led4_r = 1'b1;
+    assign led4_r = dip[4] ? 1'b0 : 1'b1;
     assign led4_g = 1'b1;
     assign led4_b = 1'b1;
 

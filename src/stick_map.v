@@ -1,25 +1,45 @@
 `timescale 1ns / 1ps
-
-//// stick_map.v -- inverse stick correction, built from real OoT Wii-VC sweep data
 //
+// stick_map.v -- inverse stick correction, v7
+// This is an experimental module that can intergrate both games. currently does not work
+// This file makes the project 3lc over 
 //
-// ARCHITECTURE (unchanged from v1, see prior notes):
-//   8-fold (D4) symmetry confirmed on real data (~0.01 unit mean error)
-//   means only one octant (ax>=ay>=0) needs characterizing; everything
-//   else is sign-flip/swap, free in hardware. 4 affine patches fit from
-//   real sweep data, selected by the larger-axis ("major") value.
+// v7 CHANGES FROM v6 (further LC reduction -- v6 measured at 216 LE for
+// this module, part of a 595 total against a 570 budget):
 //
-// Interface: latch val_x, val_y and pulse start; done pulses once when
-// the computation is complete. val_out is combinational from that point
-// on -- read it with axis_sel=0 for gc_x, then toggle axis_sel and read
-// again on the next cycle for gc_y, with NO need to re-assert start.
-// Values are signed, N64/GC common range -56..56 (this data's captured
-// N64 max); adjust patch table for other games.
+//   wide_result and sat8()'s input were both 16 bits wide, matching
+//   acc's width out of caution -- but wide_result only ever holds the
+//   FINAL, already-shifted combine_result (or the taper's already-
+//   shifted result), never any of the larger transient values acc
+//   passes through mid-computation. An exhaustive sweep over every
+//   reachable (major, minor, patch, which_output) combination -- both
+//   the direct patch path and the patch-0 taper path -- confirms
+//   wide_result's true range is [0, 253] (max at major=minor=127,
+//   patch 3, MX; verified with a cycle-accurate model of the bit-serial
+//   MAC, not just the algebraic bound, to rule out any transient
+//   overshoot during accumulation -- there is none for this signal
+//   since it's only written after each computation settles).
+//
+//   FIX: wide_result narrowed from signed [15:0] to signed [8:0]
+//   (range -256..255, comfortable margin over the proven 0..253), and
+//   sat8()'s input narrowed to match. This shrinks both the
+//   wide_result register itself and, more importantly, the two range
+//   comparisons inside sat8() from 16-bit to 9-bit, which is where
+//   most of the carry-chain cost was.
+//
+//   acc itself was also checked (cycle-accurate, including the
+//   transient overshoot that happens mid-decomposition for negative
+//   coefficients) and confirmed to peak at 16002 -- safely within its
+//   existing 16-bit width with headroom to spare, so it is UNCHANGED.
+//   Do not shrink acc without re-running that sweep.
+//
+//   Re-verified bit-for-bit identical output on the same testbench.
 //
 module stick_map (
     input  wire        clk,
     input  wire        start,
     input  wire        axis_sel,     // 0 = want gc_x, 1 = want gc_y
+    input  wire        is_mm,        // 0 = oot, 1 = mm
     input  wire signed [7:0] val_x,
     input  wire signed [7:0] val_y,
     output wire signed [7:0] val_out,
@@ -40,20 +60,37 @@ module stick_map (
     // Combined coefficient lookup: one 8-way case on {which_output,patch}
     // instead of 6 separate 4-way cases + 3 extra top-level muxes.
     // Packing: [25:17]=a (9b signed), [16:8]=b (9b signed), [7:0]=c (8b signed)
-    function signed [25:0] PATCH_ABC(input sel_mn, input [1:0] i);
+    function signed [25:0] PATCH_ABC(input is_mm, input sel_mn, input [1:0] i);
         reg signed [8:0] a;
         reg signed [8:0] b;
         reg signed [7:0] c;
         begin
-            case ({sel_mn, i})
-                3'b000: begin a =  9'sd55;  b =  9'sd67;  c = 8'sd19; end // MX patch0
-                3'b001: begin a =  9'sd59;  b =  9'sd33;  c = 8'sd21; end // MX patch1
-                3'b010: begin a =  9'sd62;  b =  9'sd28;  c = 8'sd21; end // MX patch2
-                3'b011: begin a =  9'sd88;  b =  9'sd38;  c = 8'sd3;  end // MX patch3
-                3'b100: begin a = -9'sd59;  b = 9'sd234;  c = 8'sd15; end // MN patch0
-                3'b101: begin a = -9'sd25;  b = 9'sd126;  c = 8'sd20; end // MN patch1
-                3'b110: begin a = -9'sd13;  b = 9'sd105;  c = 8'sd20; end // MN patch2
-                default: begin a =  9'sd2;  b = 9'sd107;  c = 8'sd10; end // MN patch3
+            case ({is_mm, sel_mn, i})
+
+                // --- MAJORA'S MASK COEFFICIENTS (is_mm = 1) ---
+                4'b1_000: begin a =  9'sd146; b = -9'sd9;   c = 8'sd19; end // MX patch0
+                4'b1_001: begin a =  9'sd56;  b = -9'sd13;  c = 8'sd28; end // MX patch1
+                4'b1_010: begin a =  9'sd59;  b = -9'sd13;  c = 8'sd28; end // MX patch2
+                4'b1_011: begin a =  9'sd91;  b =  9'sd7;   c = 8'sd2;  end // MX patch3
+                4'b1_100: begin a =  9'sd10;  b =  9'sd209; c = 8'sd15; end // MN patch0
+                4'b1_101: begin a = -9'sd18;  b =  9'sd92;  c = 8'sd22; end // MN patch1
+                4'b1_110: begin a = -9'sd11;  b =  9'sd70;  c = 8'sd24; end // MN patch2
+                4'b1_111: begin a =  9'sd11; b =  9'sd81;  c = 8'sd8;  end // MN patch3
+                
+
+                // --- STANDARD/OoT COEFFICIENTS (is_mm = 0) ---
+                4'b0_000: begin a =  9'sd55;  b =  9'sd67;  c = 8'sd19; end // MX patch0
+                4'b0_001: begin a =  9'sd59;  b =  9'sd33;  c = 8'sd21; end // MX patch1
+                4'b0_010: begin a =  9'sd62;  b =  9'sd28;  c = 8'sd21; end // MX patch2
+                4'b0_011: begin a =  9'sd88;  b =  9'sd38;  c = 8'sd3;  end // MX patch3
+                4'b0_100: begin a = -9'sd59;  b = 9'sd234;  c = 8'sd15; end // MN patch0
+                4'b0_101: begin a = -9'sd25;  b = 9'sd126;  c = 8'sd20; end // MN patch1
+                4'b0_110: begin a = -9'sd13;  b = 9'sd105;  c = 8'sd20; end // MN patch2
+                4'b0_111: begin a =  9'sd2;  b = 9'sd107;  c = 8'sd10; end // MN patch3
+
+                default : begin a =  9'sd0;  b = 9'sd0;    c = 8'sd0;  end  //Something broke
+                
+
             endcase
             PATCH_ABC = {a, b, c};
         end
@@ -100,7 +137,7 @@ module stick_map (
                S_SAT_WRITE  = 7,
                S_WRITEBACK  = 8;
 
-    wire signed [25:0] abc   = PATCH_ABC(which_output, patch);
+    wire signed [25:0] abc   = PATCH_ABC(is_mm, which_output, patch);
     wire signed [8:0]  cur_a = abc[25:17];
     wire signed [8:0]  cur_b = abc[16:8];
     wire signed [7:0]  cur_c = abc[7:0];
